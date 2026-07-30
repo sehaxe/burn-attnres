@@ -1,0 +1,22 @@
+[package]
+name = "burn-attnres"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Attention Residuals for Burn — learned depth-wise attention over layer outputs (Moonshot/Kimi)"
+keywords = ["burn", "attention", "residual", "transformer", "depth"]
+repository = "https://github.com/sehaxe/burn-attnres"
+homepage = "https://github.com/sehaxe/burn-attnres"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+
+[dependencies]
+burn = { version = "0.21", default-features = false }
+burn-tensor = "0.21"
+
+[dev-dependencies]
+burn-ndarray = { version = "0.21", features = ["blas-openblas"] }
+burn = { version = "0.21", features = ["ndarray"] }
