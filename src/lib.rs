@@ -1,4 +1,4 @@
-//! # burn-attnres — Attention Residuals for Burn
+//! # burn-attnres - Attention Residuals for Burn
 //!
 //! | arXiv | Mode | What |
 //! |-------|------|------|
@@ -28,11 +28,9 @@ pub struct AttnRes<B: Backend> {
 impl<B: Backend> AttnRes<B> {
     pub fn new(d_model: usize, device: &B::Device) -> Self {
         Self {
-            query: Initializer::Normal {
-                mean: 0.0,
-                std: 0.02,
-            }
-            .init([d_model], device),
+            // Paper §5: pseudo-queries MUST be initialized to zero (gives
+            // exactly uniform alpha at init; prevents training volatility).
+            query: Initializer::Zeros.init([d_model], device),
         }
     }
 
@@ -57,11 +55,8 @@ pub struct BlockAttnRes<B: Backend> {
 impl<B: Backend> BlockAttnRes<B> {
     pub fn new(d_model: usize, block_size: usize, device: &B::Device) -> Self {
         Self {
-            query: Initializer::Normal {
-                mean: 0.0,
-                std: 0.02,
-            }
-            .init([d_model], device),
+            // Paper §5: pseudo-queries MUST be initialized to zero.
+            query: Initializer::Zeros.init([d_model], device),
             block_size,
         }
     }
@@ -79,7 +74,8 @@ impl<B: Backend> BlockAttnRes<B> {
         let num_blocks = n.div_ceil(self.block_size);
         let mut block_reps: Vec<Tensor<B, 3>> = Vec::with_capacity(num_blocks);
 
-        // Within-block: standard residual (mean). Between-block: AttnRes.
+        // Within-block: standard residual accumulation. Between-block: AttnRes.
+        // Paper Eq 5: block rep b_n = sum of layer outputs (plain sum, no mean).
         for b in 0..num_blocks {
             let start = b * self.block_size;
             let end = (start + self.block_size).min(n);
@@ -87,14 +83,7 @@ impl<B: Backend> BlockAttnRes<B> {
             for h in &history[(start + 1)..end] {
                 block_sum = block_sum + h.clone();
             }
-            let count = (end - start) as f32;
-            block_reps.push(block_sum.div_scalar(count));
-        }
-
-        // Last partial block gets the actual partial sum (not averaged)
-        if !n.is_multiple_of(self.block_size) && block_reps.len() > 1 {
-            let last = block_reps.pop().unwrap();
-            block_reps.push(last);
+            block_reps.push(block_sum);
         }
 
         depth_attend(&block_reps, self.query.val())
@@ -103,10 +92,10 @@ impl<B: Backend> BlockAttnRes<B> {
 
 /// Core depth-wise attention: softmax over history via learned query.
 ///
-/// `history`: `[h0, ..., hN]` — each `[B, T, D]`
-/// `query`: `[D]` — learned per-layer pseudo-query
+/// `history`: `[h0, ..., hN]` - each `[B, T, D]`
+/// `query`: `[D]` - learned per-layer pseudo-query
 ///
-/// Returns `[B, T, D]` — weighted sum via softmax attention over depth.
+/// Returns `[B, T, D]` - weighted sum via softmax attention over depth.
 pub fn depth_attend<B: Backend>(history: &[Tensor<B, 3>], query: Tensor<B, 1>) -> Tensor<B, 3> {
     let n = history.len();
     if n == 1 {
@@ -159,7 +148,7 @@ mod tests {
     fn depth_attend_single() {
         let h = random_h(2, 8, 16);
         let q = Tensor::<B, 1>::random([16], Distribution::Default, &dev());
-        let out = depth_attend(&[h.clone()], q);
+        let out = depth_attend(std::slice::from_ref(&h), q);
         let d: Vec<f32> = (out - h)
             .into_data()
             .bytes

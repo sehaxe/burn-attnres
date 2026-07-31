@@ -1,4 +1,4 @@
-# burn-attnres — Attention Residuals for Burn
+# burn-attnres - Attention Residuals for Burn
 
 [![CI](https://github.com/sehaxe/burn-attnres/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-attnres/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-attnres)](https://crates.io/crates/burn-attnres)
