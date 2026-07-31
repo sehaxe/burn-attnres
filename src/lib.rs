@@ -64,29 +64,23 @@ impl<B: Backend> BlockAttnRes<B> {
     /// Block AttnRes: accumulate within blocks, attend between blocks.
     ///
     /// `history`: all previous hidden states [h0, h1, ..., hL-1].
-    /// Groups into `ceil(L / block_size)` blocks, applies depth attention.
+    /// Groups into `ceil(L / block_size)` blocks, applies depth attention
+    /// over the block summaries (paper Eq 5-6: plain sums; the current
+    /// partial block is attended from its second layer on).
     pub fn forward(&self, history: &[Tensor<B, 3>]) -> Tensor<B, 3> {
         let n = history.len();
-        if n <= self.block_size {
-            return depth_attend(history, self.query.val());
+        assert!(n > 0, "BlockAttnRes::forward needs >= 1 history entry");
+        if n == 1 {
+            return history[0].clone();
         }
-
-        let num_blocks = n.div_ceil(self.block_size);
-        let mut block_reps: Vec<Tensor<B, 3>> = Vec::with_capacity(num_blocks);
-
-        // Within-block: standard residual accumulation. Between-block: AttnRes.
-        // Paper Eq 5: block rep b_n = sum of layer outputs (plain sum, no mean).
-        for b in 0..num_blocks {
-            let start = b * self.block_size;
-            let end = (start + self.block_size).min(n);
-            let mut block_sum = history[start].clone();
-            for h in &history[(start + 1)..end] {
-                block_sum = block_sum + h.clone();
-            }
-            block_reps.push(block_sum);
+        let [b, t, d] = history[0].dims();
+        let dev = history[0].device();
+        let mut st = BlockAttnState::new(b, t, d, &dev);
+        let mut last = history[0].clone();
+        for h in history {
+            last = self.step(h.clone(), &mut st);
         }
-
-        depth_attend(&block_reps, self.query.val())
+        last
     }
 }
 
@@ -122,6 +116,144 @@ pub fn depth_attend<B: Backend>(history: &[Tensor<B, 3>], query: Tensor<B, 1>) -
         .mul(weights.reshape([nh, bh, th, 1usize]))
         .sum_dim(0)
         .reshape([b, t, d])
+}
+
+/// Online-softmax attention score of one source against the query
+/// (identical normalization and scale to [`depth_attend`]).
+fn source_score<B: Backend>(query: &Tensor<B, 1>, src: &Tensor<B, 3>) -> Tensor<B, 3> {
+    let [_, _, d] = src.dims();
+    let norm = src.clone()
+        / src
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(2)
+            .add_scalar(1e-5)
+            .sqrt();
+    let q = query.clone().reshape([1, 1, d]);
+    // sum_dim keeps the size-1 dim: [B,T,1]
+    (q * norm).sum_dim(2).mul_scalar((d as f64).powf(-0.5))
+}
+
+/// Streaming state for [`BlockAttnRes::step`]: online-softmax attention over
+/// completed blocks plus a running partial block (paper Eq 6 + Algorithm 1).
+///
+/// The caller owns the state and calls `step(h)` per new layer output;
+/// `step` returns the attention output for that position, O(1) in the number
+/// of completed blocks (no full recompute, no O(L·d) history retention).
+#[derive(Debug)]
+pub struct BlockAttnState<B: Backend> {
+    /// Running sum of the current block's layer outputs.
+    pub partial: Tensor<B, 3>,
+    pub partial_count: usize,
+    /// Online softmax over completed block reps: max score, exp-sum, weighted values.
+    pub max_score: Tensor<B, 3>,
+    pub sum_exp: Tensor<B, 3>,
+    pub acc: Tensor<B, 3>,
+    pub started: bool,
+}
+
+impl<B: Backend> BlockAttnState<B> {
+    pub fn new(b: usize, t: usize, d: usize, device: &B::Device) -> Self {
+        Self {
+            partial: Tensor::zeros([b, t, d], device),
+            partial_count: 0,
+            max_score: Tensor::zeros([b, t, 1], device),
+            sum_exp: Tensor::zeros([b, t, 1], device),
+            acc: Tensor::zeros([b, t, d], device),
+            started: false,
+        }
+    }
+
+    fn incorporate(&mut self, query: &Tensor<B, 1>, src: &Tensor<B, 3>) {
+        let s = source_score(query, src); // [B,T,1]
+        if !self.started {
+            self.max_score = s.clone();
+            self.sum_exp = Tensor::ones([s.dims()[0], s.dims()[1], 1], &src.device());
+            self.acc = src.clone();
+            self.started = true;
+            return;
+        }
+        // max(a,b) = (a + b + |a-b|) / 2 (burn 0.21 has no elementwise max)
+        let m_new =
+            (self.max_score.clone() + s.clone() + (self.max_score.clone() - s.clone()).abs())
+                .div_scalar(2.0);
+        let rescale = (self.max_score.clone() - m_new.clone()).exp();
+        self.acc = self.acc.clone().mul(rescale.clone())
+            + src.clone().mul((s.clone() - m_new.clone()).exp());
+        self.sum_exp = self.sum_exp.clone().mul(rescale) + (s - m_new.clone()).exp();
+        self.max_score = m_new;
+    }
+
+    /// Attention output over the currently attended sources.
+    fn attended(&self) -> Tensor<B, 3> {
+        self.acc.clone() / self.sum_exp.clone().clamp_min(1e-12)
+    }
+}
+
+impl<B: Backend> BlockAttnRes<B> {
+    /// Create a fresh streaming state for `[b, t, d]` inputs.
+    pub fn init_state(
+        &self,
+        b: usize,
+        t: usize,
+        d: usize,
+        device: &B::Device,
+    ) -> BlockAttnState<B> {
+        BlockAttnState::new(b, t, d, device)
+    }
+
+    /// Streaming block attention (paper §4.2, Algorithm 1 + Eq 6).
+    ///
+    /// `h`: the new layer output. Updates the running partial block; when the
+    /// block completes (`block_size` outputs) it is folded into the attended
+    /// set via an online-softmax merge. The partial block is attended only
+    /// from its second layer on (Eq 6: the block's first layer excludes the
+    /// current partial sum, which would otherwise create a self-loop).
+    ///
+    /// Returns the depth-attention output `[B, T, D]`.
+    pub fn step(&self, h: Tensor<B, 3>, st: &mut BlockAttnState<B>) -> Tensor<B, 3> {
+        let [b, t, d] = h.dims();
+        st.partial = if st.partial_count == 0 {
+            h.clone()
+        } else {
+            st.partial.clone() + h.clone()
+        };
+        st.partial_count += 1;
+
+        // Attended sources: completed blocks (online state) + partial block
+        // if it is past its first layer. With no sources at all (first layer
+        // of the first block) the output is the identity (h).
+        let mut out = if st.started || st.partial_count >= 2 {
+            st.attended()
+        } else {
+            h.clone()
+        };
+        if st.partial_count >= 2 {
+            let s_p = source_score(&self.query.val(), &st.partial);
+            if st.started {
+                // max(a,b) = (a + b + |a-b|) / 2 (burn 0.21 has no elementwise max)
+                let m_new = (st.max_score.clone()
+                    + s_p.clone()
+                    + (st.max_score.clone() - s_p.clone()).abs())
+                .div_scalar(2.0);
+                let rescale = (st.max_score.clone() - m_new.clone()).exp();
+                let acc_p = st.acc.clone().mul(rescale.clone())
+                    + st.partial.clone().mul((s_p.clone() - m_new.clone()).exp());
+                let sum_p = st.sum_exp.clone().mul(rescale) + (s_p - m_new.clone()).exp();
+                out = acc_p / sum_p.clamp_min(1e-12);
+            } else {
+                out = st.partial.clone();
+            }
+        }
+
+        if st.partial_count == self.block_size {
+            let completed = st.partial.clone();
+            st.incorporate(&self.query.val(), &completed);
+            st.partial = Tensor::zeros([b, t, d], &h.device());
+            st.partial_count = 0;
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +309,27 @@ mod tests {
         let a = BlockAttnRes::new(32, 4, &dev());
         let h = vec![random_h(1, 4, 32), random_h(1, 4, 32)]; // fewer than block_size
         assert_eq!(a.forward(&h).dims(), [1, 4, 32]);
+    }
+
+    #[test]
+    fn streaming_matches_full_recompute() {
+        // The paper's streaming scheme (Eq 6 semantics: partial block
+        // excluded at its first layer, attended from its second layer on)
+        // must reproduce the full-recompute BlockAttnRes at every step.
+        let a = BlockAttnRes::new(16, 2, &dev());
+        let (b, t, d) = (1usize, 3usize, 16usize);
+        let mut st = a.init_state(b, t, d, &dev());
+        let mut history: Vec<Tensor<B, 3>> = Vec::new();
+        for step in 0..6 {
+            let h = random_h(b, t, d);
+            history.push(h.clone());
+            let streamed = a.step(h, &mut st);
+            let full = a.forward(&history);
+            let diff: f32 = (streamed - full).powf_scalar(2.0).mean().into_scalar();
+            assert!(
+                diff < 1e-5,
+                "step {step}: streaming mse {diff} vs full recompute"
+            );
+        }
     }
 }
