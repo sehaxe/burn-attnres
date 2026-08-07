@@ -17,32 +17,37 @@ use std::cell::RefCell;
 
 const THREADS: u32 = 256;
 
-// ponytail: single-slot cache for the internal [L,B,T,D] stack. A fresh
-// 800MB CUDA allocation costs ~15ms (default allocator); the stack never
-// escapes depth_attend_cuda so reusing one buffer is safe. If call shapes
-// vary, this degrades to one extra allocation per shape.
+/// Layers per chunk in the chunked `depth_attend` (paper's N ≈ 8). Peak
+/// memory scales as `(G+2)·B·T·D`; G=8 balances the running-state traffic
+/// against the chunk stack size.
+pub const CHUNK_G: usize = 8;
+
+// ponytail: single-slot cache for the internal [G,B,T,D] chunk stack. A fresh
+// CUDA allocation costs ~15ms of first-touch page faults (default allocator);
+// the chunk never escapes depth_attend_cuda so reusing one buffer is safe.
+// One extra allocation per distinct chunk shape otherwise.
 thread_local! {
-    static STACK_CACHE: RefCell<Option<(usize, usize, usize, usize, CubeTensor<cubecl::cuda::CudaRuntime>)>> =
+    static CHUNK_CACHE: RefCell<Option<(usize, usize, usize, usize, CubeTensor<cubecl::cuda::CudaRuntime>)>> =
         const { RefCell::new(None) };
 }
 
-fn cached_stack(
-    l: usize,
+fn cached_chunk(
+    g: usize,
     b: usize,
     t: usize,
     d: usize,
     device: &burn::tensor::Device,
 ) -> CubeTensor<cubecl::cuda::CudaRuntime> {
-    STACK_CACHE.with(|c| {
+    CHUNK_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if let Some((cl, cb, ct, cd, buf)) = &*c {
-            if (*cl, *cb, *ct, *cd) == (l, b, t, d) {
+            if (*cl, *cb, *ct, *cd) == (g, b, t, d) {
                 return buf.clone();
             }
         }
-        let s = Tensor::<4>::empty([l, b, t, d], device);
-        let buf = cube_of(&s).expect("bare CUDA stack");
-        *c = Some((l, b, t, d, buf.clone()));
+        let s = Tensor::<4>::empty([g, b, t, d], device);
+        let buf = cube_of(&s).expect("bare CUDA chunk");
+        *c = Some((g, b, t, d, buf.clone()));
         buf
     })
 }
@@ -50,8 +55,7 @@ fn cached_stack(
 fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
     type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let c = (&prim as &dyn Any)
-        .downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
     Some(c.clone())
 }
 
@@ -59,17 +63,22 @@ fn cube_of_1(t: &Tensor<1>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
     cube_of(t)
 }
 
-/// Full AttnRes without burn's `Tensor::cat` (measured ~23ms for the stacked
-/// copy on CUDA). The per-layer scores launches fill the `[L, B, T, D]` stack
-/// as a by-product (coalesced extra write), so the weighted sum runs in ONE
-/// launch that reads the stack once and writes `out` once.
+/// Chunked Full AttnRes (Kimi K3 §2.2, exact math, bounded memory).
+///
+/// The history is processed in chunks of `G` layers: per-layer score launches
+/// (RMS norm + `q·h` in one read pass, tree reductions) fill the `[G,B,T,D]`
+/// chunk stack as a by-product, and one chunk kernel per chunk folds the
+/// chunk into a running online-softmax state `(acc, max, sum)` — `acc` keeps
+/// every seen layer's contribution in one `[B,T,D]`, so peak memory is
+/// `(G+2)·B·T·D` instead of `(L+1)·B·T·D`. The final division recovers the
+/// exact full-depth softmax weights (no Block approximation).
 #[cube(launch_unchecked)]
 fn attnres_scores_kernel<F: Float>(
     h: &[F],          // [B, T, D] one layer
     q: &[F],          // [D]
-    scores: &mut [F], // [L, B, T] row `li`
-    stacked: &mut [F], // [L, B, T, D] row `li`
-    li: u32,
+    scores: &mut [F], // [G, B, T] row `row`
+    chunk: &mut [F],  // [G, B, T, D] row `row`
+    row: u32,
     scale: f32,
     #[comptime] bt_count: u32, // B * T
     #[comptime] d: u32,
@@ -96,7 +105,7 @@ fn attnres_scores_kernel<F: Float>(
             let v = h[base + col];
             psq += v * v;
             pdot += q[col] * v;
-            stacked[(li as usize) * bt_count * d + base + col] = v;
+            chunk[(row as usize) * bt_count * d + base + col] = v;
         }
     }
     red[tid] = psq;
@@ -122,87 +131,117 @@ fn attnres_scores_kernel<F: Float>(
     let dot = red[0];
 
     if tid == 0 {
-        scores[(li as usize) * bt_count + bt] =
+        scores[(row as usize) * bt_count + bt] =
             dot * F::cast_from(scale) / (sq + F::new(1e-5_f32)).sqrt();
     }
 }
 
-/// Softmax over the L axis of [L, B, T] raw scores -> [L, B, T] weights.
-/// One thread per (b,t): L < 256, so a single thread scans the L elements
-/// twice (max, then exp/sum) with zero shared memory or syncs.
+/// Fold one chunk into the running online-softmax state.
+///
+/// Per (b,t): chunk max m_c and exp-sum, running merge
+/// m' = max(m, m_c); acc' = acc·e^(m−m') + Σ_g e^(s_g−m')·h_g;
+/// sum' = sum·e^(m−m') + sumexp_c·e^(m_c−m'); the last chunk writes
+/// out = acc'/clamp(sum', 1e-12). All state reads happen before any write, so
+/// no cross-thread race on `max_s`/`sum_e`.
 #[cube(launch_unchecked)]
-fn attnres_softmax_kernel<F: Float>(
-    scores: &[F],      // [L, B, T]
-    weights: &mut [F], // [L, B, T]
-    #[comptime] l: u32,
-    #[comptime] bt_count: u32,
-) {
-    let bt = CUBE_POS_X as usize;
-    let l = l as usize;
-    let bt_count = bt_count as usize;
-
-    let mut mx = F::new(-3.0e38_f32);
-    let mut li = 0;
-    while li < l {
-        let s = scores[li * bt_count + bt];
-        if s > mx {
-            mx = s;
-        }
-        li += 1;
-    }
-    let mut sum_e = F::new(0.0_f32);
-    let mut li = 0;
-    while li < l {
-        sum_e += (scores[li * bt_count + bt] - mx).exp();
-        li += 1;
-    }
-    let mut li = 0;
-    while li < l {
-        weights[li * bt_count + bt] = (scores[li * bt_count + bt] - mx).exp() / sum_e;
-        li += 1;
-    }
-}
-
-/// out[b,t,d] = sum_l weights[l,b,t] * stacked[l,b,t,d]. One launch; each
-/// thread accumulates its slab over the L axis in registers and writes `out`
-/// once (no read-modify-write across launches).
-#[cube(launch_unchecked)]
-fn attnres_weighted_sum_kernel<F: Float>(
-    stacked: &[F], // [L, B, T, D]
-    weights: &[F], // [L, B, T]
-    out: &mut [F], // [B, T, D]
-    #[comptime] l: u32,
+fn attnres_chunk_kernel<F: Float>(
+    scores: &[F],    // [G, B, T] current chunk (rows >= ga stale)
+    chunk: &[F],     // [G, B, T, D] current chunk
+    acc: &mut [F],   // [B, T, D] running weighted sum
+    max_s: &mut [F], // [B, T] running max
+    sum_e: &mut [F], // [B, T] running exp sum
+    out: &mut [F],   // [B, T, D] written on the last chunk
+    #[comptime] g: u32,
+    #[comptime] ga: u32, // actual layer count of this chunk (tail < G)
     #[comptime] bt_count: u32,
     #[comptime] d: u32,
     #[comptime] threads: u32,
     #[comptime] per: u32,
+    #[comptime] first: bool,
+    #[comptime] last: bool,
 ) {
     let bt = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
-    let l = l as usize;
+    let g = g as usize;
     let bt_count = bt_count as usize;
     let d = d as usize;
     let threads = threads as usize;
     let per = per as usize;
     let base = bt * d;
 
+    // comptime loops with a runtime `ga` guard: the tail chunk reuses the
+    // scores/chunk buffers and stale rows above ga must not contribute
+    let mut m_c = F::new(-3.0e38_f32);
+    for li in 0..g {
+        if (li as u32) < ga {
+            let s = scores[li * bt_count + bt];
+            if s > m_c {
+                m_c = s;
+            }
+        }
+    }
+    let mut sumexp_c = F::new(0.0_f32);
+    for li in 0..g {
+        if (li as u32) < ga {
+            sumexp_c += (scores[li * bt_count + bt] - m_c).exp();
+        }
+    }
+
+    let m_old = max_s[bt];
+    let sum_old = sum_e[bt];
+    let mut m_new = m_old;
+    if m_c > m_old {
+        m_new = m_c;
+    }
+    let rescale = (m_old - m_new).exp();
+    let sum_new = sum_old * rescale + sumexp_c * (m_c - m_new).exp();
+
+    let mut ws = Shared::<[F]>::new_slice(g);
+    for li in 0..g {
+        if (li as u32) < ga {
+            ws[li] = (scores[li * bt_count + bt] - m_new).exp();
+        } else {
+            ws[li] = F::new(0.0_f32);
+        }
+    }
+
     for j in 0..per {
         let col = j * threads + tid;
         if col < d {
-            let mut acc = F::new(0.0_f32);
-            for li in 0..l {
-                acc += stacked[li * bt_count * d + base + col] * weights[li * bt_count + bt];
+            let mut a = F::new(0.0_f32);
+            for li in 0..g {
+                if (li as u32) < ga {
+                    a += ws[li] * chunk[li * bt_count * d + base + col];
+                }
             }
-            out[base + col] = acc;
+            let acc_new = if first {
+                a
+            } else {
+                acc[base + col] * rescale + a
+            };
+            acc[base + col] = acc_new;
+            if last {
+                let mut den = sum_new;
+                if den < F::new(1e-12_f32) {
+                    den = F::new(1e-12_f32);
+                }
+                out[base + col] = acc_new / den;
+            }
         }
+    }
+    if tid == 0 {
+        max_s[bt] = m_new;
+        sum_e[bt] = sum_new;
     }
 }
 
-/// `source_score`: RMS-norm + q·src·scale in one launch -> [B, T, 1].
+// ---- dispatch (bare CUDA backend only, callers fall back to tensor path) ----
+
+/// `source_score` (streaming path): RMS-norm + q·src·scale -> [B, T, 1].
 #[cube(launch_unchecked)]
 fn source_score_kernel<F: Float>(
-    h: &[F],   // [B, T, D]
-    q: &[F],   // [D]
+    h: &[F],       // [B, T, D]
+    q: &[F],       // [D]
     out: &mut [F], // [B, T]
     scale: f32,
     #[comptime] d: u32,
@@ -215,20 +254,22 @@ fn source_score_kernel<F: Float>(
     let d = d as usize;
     let threads = threads as usize;
     let per = per as usize;
-    let base = bt * d;
     let lg = log_threads as usize;
+    let base = bt * d;
 
     let mut red = Shared::<[F]>::new_slice(threads);
 
-    let mut p = F::new(0.0_f32);
+    let mut psq = F::new(0.0_f32);
+    let mut pdot = F::new(0.0_f32);
     for j in 0..per {
         let col = j * threads + tid;
         if col < d {
             let v = h[base + col];
-            p += v * v;
+            psq += v * v;
+            pdot += q[col] * v;
         }
     }
-    red[tid] = p;
+    red[tid] = psq;
     sync_cube();
     for k in 0..lg {
         let stride = threads >> (k + 1);
@@ -239,15 +280,7 @@ fn source_score_kernel<F: Float>(
     }
     let sq = red[0];
     sync_cube();
-
-    let mut p = F::new(0.0_f32);
-    for j in 0..per {
-        let col = j * threads + tid;
-        if col < d {
-            p += q[col] * h[base + col];
-        }
-    }
-    red[tid] = p;
+    red[tid] = pdot;
     sync_cube();
     for k in 0..lg {
         let stride = threads >> (k + 1);
@@ -263,10 +296,10 @@ fn source_score_kernel<F: Float>(
     }
 }
 
-/// Online-softmax merge (paper Eq 9 streaming): fold `src` with score `s` into
-/// the running state and emit the attended output in one launch.
+/// Online-softmax merge (streaming path): fold `src` with score `s` into the
+/// running state and emit the attended output in one launch.
 ///
-/// state update: m' = max(m, s); acc' = acc·e^(m−m') + src·e^(s−m');
+/// m' = max(m, s); acc' = acc·e^(m−m') + src·e^(s−m');
 /// sum' = sum·e^(m−m') + e^(s−m'); out = acc'/clamp(sum', 1e-12).
 #[cube(launch_unchecked)]
 fn merge_kernel<F: Float>(
@@ -297,29 +330,24 @@ fn merge_kernel<F: Float>(
     let w = (sval - m_new).exp();
     let sum_new = sum_exp[bt] * rescale + w;
 
-    let mut j = 0;
-    while j < per {
+    for j in 0..per {
         let col = j * threads + tid;
         if col < d {
             let i = base + col;
             let a = acc[i] * rescale + src[i] * w;
             acc[i] = a;
-            let den = sum_new;
-            let mut den = den;
+            let mut den = sum_new;
             if den < F::new(1e-12_f32) {
                 den = F::new(1e-12_f32);
             }
             out[i] = a / den;
         }
-        j += 1;
     }
     if tid == 0 {
         max_s[bt] = m_new;
         sum_exp[bt] = sum_new;
     }
 }
-
-// ---- dispatch (bare CUDA backend only, callers fall back to tensor path) ----
 
 pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Tensor<3>> {
     let l = history.len();
@@ -333,16 +361,19 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
     let qc = cube_of(query)?;
     let hc: Vec<CubeTensor<cubecl::cuda::CudaRuntime>> =
         history.iter().map(cube_of).collect::<Option<_>>()?;
-    // empty (no memset): the scores pass fills the stack, the weighted pass
-    // writes out exactly once
+    // chunked: peak memory (G+2)*B*T*D instead of (L+1)*B*T*D; the chunk
+    // stack is cached (never escapes), out is written once by the last chunk
     let dev = &history[0].device();
-    let stc = cached_stack(l, b, t, d, dev);
+    let g = CHUNK_G.min(l);
+    let stc = cached_chunk(g, b, t, d, dev);
+    let max_s = Tensor::<2>::full([b, t], -3.0e38_f32, dev);
+    let mxc = cube_of(&max_s)?;
+    let sum_e = Tensor::<2>::zeros([b, t], dev);
+    let sec = cube_of(&sum_e)?;
     let out = Tensor::<3>::empty([b, t, d], dev);
     let oc = cube_of(&out)?;
-    let scores = Tensor::<2>::zeros([l, b * t], dev);
+    let scores = Tensor::<2>::zeros([g, b * t], dev);
     let sc2 = cube_of(&scores)?;
-    let weights = Tensor::<2>::zeros([l, b * t], dev);
-    let wc = cube_of(&weights)?;
     let client = hc[0].client.clone();
     let per = (d as u32).div_ceil(THREADS);
     let dim = CubeDim {
@@ -352,47 +383,55 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
     };
     let scale = (d as f64).powf(-0.5) as f32;
     let bt = (b * t) as u32;
+    let chunks = l.div_ceil(g);
     unsafe {
-        for (li, h) in hc.iter().enumerate() {
-            attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        for c in 0..chunks {
+            let first = c == 0;
+            let last = c == chunks - 1;
+            for gi in 0..g {
+                let li = c * g + gi;
+                if li >= l {
+                    break;
+                }
+                let h = &hc[li];
+                attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+                    &client,
+                    CubeCount::Static(bt, 1, 1),
+                    dim,
+                    BufferArg::from_raw_parts(h.handle.clone(), b * t * d),
+                    BufferArg::from_raw_parts(qc.handle.clone(), d),
+                    BufferArg::from_raw_parts(sc2.handle.clone(), g * b * t),
+                    BufferArg::from_raw_parts(stc.handle.clone(), g * b * t * d),
+                    gi as u32,
+                    scale,
+                    bt,
+                    d as u32,
+                    THREADS,
+                    per,
+                    THREADS.ilog2(),
+                );
+            }
+            let ga = g.min(l - c * g);
+            attnres_chunk_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
                 &client,
                 CubeCount::Static(bt, 1, 1),
                 dim,
-                BufferArg::from_raw_parts(h.handle.clone(), b * t * d),
-                BufferArg::from_raw_parts(qc.handle.clone(), d),
-                BufferArg::from_raw_parts(sc2.handle.clone(), l * b * t),
-                BufferArg::from_raw_parts(stc.handle.clone(), l * b * t * d),
-                li as u32,
-                scale,
+                BufferArg::from_raw_parts(sc2.handle.clone(), g * b * t),
+                BufferArg::from_raw_parts(stc.handle.clone(), g * b * t * d),
+                BufferArg::from_raw_parts(oc.handle.clone(), b * t * d),
+                BufferArg::from_raw_parts(mxc.handle.clone(), b * t),
+                BufferArg::from_raw_parts(sec.handle.clone(), b * t),
+                BufferArg::from_raw_parts(oc.handle.clone(), b * t * d),
+                g as u32,
+                ga as u32,
                 bt,
                 d as u32,
                 THREADS,
                 per,
-                THREADS.ilog2(),
+                first,
+                last,
             );
         }
-        attnres_softmax_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
-            &client,
-            CubeCount::Static(bt, 1, 1),
-            CubeDim { x: 1, y: 1, z: 1 },
-            BufferArg::from_raw_parts(sc2.handle.clone(), l * b * t),
-            BufferArg::from_raw_parts(wc.handle.clone(), l * b * t),
-            l as u32,
-            bt,
-        );
-        attnres_weighted_sum_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
-            &client,
-            CubeCount::Static(bt, 1, 1),
-            dim,
-            BufferArg::from_raw_parts(stc.handle, l * b * t * d),
-            BufferArg::from_raw_parts(wc.handle, l * b * t),
-            BufferArg::from_raw_parts(oc.handle.clone(), b * t * d),
-            l as u32,
-            bt,
-            d as u32,
-            THREADS,
-            per,
-        );
     }
     Some(out)
 }
@@ -501,7 +540,10 @@ mod tests {
     }
 
     fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
     }
 
     /// Raw-op depth_attend on the same device as the fused call.
@@ -552,13 +594,17 @@ mod tests {
         let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
         let scale = (d as f64).powf(-0.5);
         let norm = src.clone()
-            / src.clone()
+            / src
+                .clone()
                 .powf_scalar(2.0)
                 .sum_dim(2)
                 .add_scalar(1e-5)
                 .sqrt();
-        let expected =
-            to_host((q.clone().reshape([1, 1, d]) * norm).sum_dim(2).mul_scalar(scale));
+        let expected = to_host(
+            (q.clone().reshape([1, 1, d]) * norm)
+                .sum_dim(2)
+                .mul_scalar(scale),
+        );
         let got = source_score_cuda(&q, &src).expect("kernel");
         let md = maxdiff(&to_host(got), &expected);
         assert!(md < 1e-4, "source_score maxdiff {md}");
@@ -623,15 +669,12 @@ mod tests {
     #[ignore]
     fn attnres_bench() {
         let cdev = Device::default();
-        for (l, b, t, d) in [
-            (24usize, 1usize, 2048usize, 4096usize),
-            (8, 2, 2048, 5120),
-        ] {
+        for (l, b, t, d) in [(24usize, 1usize, 2048usize, 4096usize), (8, 2, 2048, 5120)] {
             let hist: Vec<Tensor<3>> = (0..l)
                 .map(|_| Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev))
                 .collect();
             let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let _ = depth_attend(&hist, q.clone());
             }
             let t0 = std::time::Instant::now();
@@ -640,6 +683,64 @@ mod tests {
                 let _: f32 = r.clone().sum().into_scalar(); // flush
             }
             let tf = t0.elapsed() / 10;
+            // probe: 24 trivial launches (one per layer) to isolate launch overhead
+            let hc3: Vec<_> = hist.iter().map(cube_of).collect::<Option<_>>().unwrap();
+            let client3 = hc3[0].client.clone();
+            let qc = cube_of(&q).unwrap();
+            let nidle = Tensor::<1>::zeros([l * b * t], &cdev);
+            let nc = cube_of(&nidle).unwrap();
+            let dim3 = CubeDim {
+                x: THREADS,
+                y: 1,
+                z: 1,
+            };
+            let per = (d as u32).div_ceil(THREADS);
+            for _ in 0..2 {
+                for h in &hc3 {
+                    unsafe {
+                        attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+                            &client3,
+                            CubeCount::Static((b * t) as u32, 1, 1),
+                            dim3,
+                            BufferArg::from_raw_parts(h.handle.clone(), b * t * d),
+                            BufferArg::from_raw_parts(qc.handle.clone(), d),
+                            BufferArg::from_raw_parts(nc.handle.clone(), l * b * t),
+                            BufferArg::from_raw_parts(nc.handle.clone(), l * b * t * d),
+                            0u32,
+                            (d as f64).powf(-0.5) as f32,
+                            (b * t) as u32,
+                            d as u32,
+                            THREADS,
+                            per,
+                            THREADS.ilog2(),
+                        );
+                    }
+                }
+                let _: f32 = nidle.clone().sum().into_scalar();
+            }
+            let t0 = std::time::Instant::now();
+            for h in &hc3 {
+                unsafe {
+                    attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+                        &client3,
+                        CubeCount::Static((b * t) as u32, 1, 1),
+                        dim3,
+                        BufferArg::from_raw_parts(h.handle.clone(), b * t * d),
+                        BufferArg::from_raw_parts(qc.handle.clone(), d),
+                        BufferArg::from_raw_parts(nc.handle.clone(), l * b * t),
+                        BufferArg::from_raw_parts(nc.handle.clone(), l * b * t * d),
+                        0u32,
+                        (d as f64).powf(-0.5) as f32,
+                        (b * t) as u32,
+                        d as u32,
+                        THREADS,
+                        per,
+                        THREADS.ilog2(),
+                    );
+                }
+            }
+            let _: f32 = nidle.clone().sum().into_scalar();
+            println!("    {} scores launches+work {:?}", l, t0.elapsed());
             let hs = stack(&hist);
             let t0 = std::time::Instant::now();
             for _ in 0..3 {

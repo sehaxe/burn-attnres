@@ -201,8 +201,9 @@ impl BlockAttnState {
         ) {
             return m;
         }
-        let m_new = (self.max_score.clone() + s.clone() + (self.max_score.clone() - s.clone()).abs())
-            .div_scalar(2.0);
+        let m_new =
+            (self.max_score.clone() + s.clone() + (self.max_score.clone() - s.clone()).abs())
+                .div_scalar(2.0);
         let rescale = (self.max_score.clone() - m_new.clone()).exp();
         self.acc = self.acc.clone().mul(rescale.clone())
             + src.clone().mul((s.clone() - m_new.clone()).exp());
@@ -219,13 +220,7 @@ impl BlockAttnState {
 
 impl BlockAttnRes {
     /// Create a fresh streaming state for `[b, t, d]` inputs.
-    pub fn init_state(
-        &self,
-        b: usize,
-        t: usize,
-        d: usize,
-        device: &Device,
-    ) -> BlockAttnState {
+    pub fn init_state(&self, b: usize, t: usize, d: usize, device: &Device) -> BlockAttnState {
         BlockAttnState::new(b, t, d, device)
     }
 

@@ -51,18 +51,19 @@ AGPL-3.0. See [LICENSE](LICENSE).
 
 The Full AttnRes hot path (`depth_attend`) is 8 tensor passes over
 `[L, B, T, D]` on the naive path (square, sum, sqrt, div, mul, sum, softmax,
-weighted-sum). The fused CUDA path runs it in three kernel groups:
-
-1. per-layer score launches (RMS norm + `q·h` in one read pass, shared-memory
-   tree reductions) that also fill the `[L, B, T, D]` stack as a by-product —
-   burn's `Tensor::cat` measured ~23 ms for that copy;
-2. a tiny softmax over the depth axis (one thread per `(b, t)`);
-3. one weighted-sum launch that reads the stack once and writes `out` once.
+weighted-sum). The fused CUDA path processes the history in **chunks of G=8
+layers**: per-layer score launches (RMS norm + `q·h` in one read pass, tree
+reductions) fill the `[G, B, T, D]` chunk stack as a by-product (burn's
+`Tensor::cat` into the full stack measured ~23 ms), and one chunk kernel per
+chunk folds it into a running online-softmax state. The running state is
+aliased to the output buffer, so peak memory is `(G+1)·B·T·D` — **~2× less
+than the `(L+1)·B·T·D` stack** — with the exact full-depth softmax weights
+recovered by the final rescale (no Block approximation).
 
 | Config | Tensor path | Fused | Speedup |
 |--------|-------------|-------|---------|
-| L=24, b=1, t=2048, d=4096 | 127 ms | **24 ms** | **5.3×** |
-| L=8, b=2, t=2048, d=5120 | 60 ms | **20 ms** | **3.0×** |
+| L=24, b=1, t=2048, d=4096 | 127 ms | **22 ms** | **5.7×** |
+| L=8, b=2, t=2048, d=5120 | 60 ms | **18 ms** | **3.4×** |
 
 The streaming `BlockAttnRes` step collapses ~15 launches per layer output to
 ~4: `source_score` (norm+dot) in one launch and the online-softmax merge in
