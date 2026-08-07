@@ -11,7 +11,10 @@
 //! Key results (Kimi Linear 48B): GPQA +7.5, HumanEval +3.1, MMLU +1.1.
 use burn::module::{Module, Param};
 use burn::nn::Initializer;
-use burn::tensor::{activation, backend::Backend, Tensor};
+use burn::tensor::{activation, Device, Tensor};
+
+#[cfg(feature = "cuda")]
+mod fused_attnres;
 
 /// Full AttnRes: learned pseudo-query attends over ALL previous hidden states.
 ///
@@ -21,12 +24,12 @@ use burn::tensor::{activation, backend::Backend, Tensor};
 /// out = sum_i weights[i] · h_i
 /// ```
 #[derive(Module, Debug)]
-pub struct AttnRes<B: Backend> {
-    pub query: Param<Tensor<B, 1>>,
+pub struct AttnRes {
+    pub query: Param<Tensor<1>>,
 }
 
-impl<B: Backend> AttnRes<B> {
-    pub fn new(d_model: usize, device: &B::Device) -> Self {
+impl AttnRes {
+    pub fn new(d_model: usize, device: &Device) -> Self {
         Self {
             // Paper §5: pseudo-queries MUST be initialized to zero (gives
             // exactly uniform alpha at init; prevents training volatility).
@@ -35,7 +38,7 @@ impl<B: Backend> AttnRes<B> {
     }
 
     /// Full AttnRes: attend over all previous hidden states.
-    pub fn forward(&self, history: &[Tensor<B, 3>]) -> Tensor<B, 3> {
+    pub fn forward(&self, history: &[Tensor<3>]) -> Tensor<3> {
         depth_attend(history, self.query.val())
     }
 }
@@ -46,14 +49,14 @@ impl<B: Backend> AttnRes<B> {
 /// standard residual accumulation. Between chunks: AttnRes over chunk
 /// summaries. Reduces memory from O(L·d) to O(N·d) where N ≪ L.
 #[derive(Module, Debug)]
-pub struct BlockAttnRes<B: Backend> {
-    pub query: Param<Tensor<B, 1>>,
+pub struct BlockAttnRes {
+    pub query: Param<Tensor<1>>,
     #[module(skip)]
     pub block_size: usize,
 }
 
-impl<B: Backend> BlockAttnRes<B> {
-    pub fn new(d_model: usize, block_size: usize, device: &B::Device) -> Self {
+impl BlockAttnRes {
+    pub fn new(d_model: usize, block_size: usize, device: &Device) -> Self {
         Self {
             // Paper §5: pseudo-queries MUST be initialized to zero.
             query: Initializer::Zeros.init([d_model], device),
@@ -67,7 +70,7 @@ impl<B: Backend> BlockAttnRes<B> {
     /// Groups into `ceil(L / block_size)` blocks, applies depth attention
     /// over the block summaries (paper Eq 5-6: plain sums; the current
     /// partial block is attended from its second layer on).
-    pub fn forward(&self, history: &[Tensor<B, 3>]) -> Tensor<B, 3> {
+    pub fn forward(&self, history: &[Tensor<3>]) -> Tensor<3> {
         let n = history.len();
         assert!(n > 0, "BlockAttnRes::forward needs >= 1 history entry");
         if n == 1 {
@@ -90,7 +93,7 @@ impl<B: Backend> BlockAttnRes<B> {
 /// `query`: `[D]` - learned per-layer pseudo-query
 ///
 /// Returns `[B, T, D]` - weighted sum via softmax attention over depth.
-pub fn depth_attend<B: Backend>(history: &[Tensor<B, 3>], query: Tensor<B, 1>) -> Tensor<B, 3> {
+pub fn depth_attend(history: &[Tensor<3>], query: Tensor<1>) -> Tensor<3> {
     let n = history.len();
     if n == 1 {
         return history[0].clone();
@@ -98,13 +101,18 @@ pub fn depth_attend<B: Backend>(history: &[Tensor<B, 3>], query: Tensor<B, 1>) -
     let [b, t, d] = history[0].dims();
     let scale = (d as f64).powf(-0.5);
 
-    let stacked: Vec<Tensor<B, 4>> = history
+    #[cfg(feature = "cuda")]
+    if let Some(out) = crate::fused_attnres::depth_attend_cuda(history, &query) {
+        return out;
+    }
+
+    let stacked: Vec<Tensor<4>> = history
         .iter()
         .map(|h| h.clone().unsqueeze_dim::<4>(0))
         .collect();
     let h_stack = Tensor::cat(stacked, 0);
 
-    // Per-element normalization (RMS-style, inline for perf)
+    // Tensor fallback (non-CUDA backend or fused dispatch unavailable).
     let h_norm_sq = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5);
     let [nh, bh, th, _ns] = h_norm_sq.dims();
     let h_norm = h_stack.clone() / h_norm_sq.sqrt().reshape([nh, bh, th, 1usize]);
@@ -120,7 +128,11 @@ pub fn depth_attend<B: Backend>(history: &[Tensor<B, 3>], query: Tensor<B, 1>) -
 
 /// Online-softmax attention score of one source against the query
 /// (identical normalization and scale to [`depth_attend`]).
-fn source_score<B: Backend>(query: &Tensor<B, 1>, src: &Tensor<B, 3>) -> Tensor<B, 3> {
+fn source_score(query: &Tensor<1>, src: &Tensor<3>) -> Tensor<3> {
+    #[cfg(feature = "cuda")]
+    if let Some(s) = crate::fused_attnres::source_score_cuda(query, src) {
+        return s;
+    }
     let [_, _, d] = src.dims();
     let norm = src.clone()
         / src
@@ -141,19 +153,19 @@ fn source_score<B: Backend>(query: &Tensor<B, 1>, src: &Tensor<B, 3>) -> Tensor<
 /// `step` returns the attention output for that position, O(1) in the number
 /// of completed blocks (no full recompute, no O(L·d) history retention).
 #[derive(Debug)]
-pub struct BlockAttnState<B: Backend> {
+pub struct BlockAttnState {
     /// Running sum of the current block's layer outputs.
-    pub partial: Tensor<B, 3>,
+    pub partial: Tensor<3>,
     pub partial_count: usize,
     /// Online softmax over completed block reps: max score, exp-sum, weighted values.
-    pub max_score: Tensor<B, 3>,
-    pub sum_exp: Tensor<B, 3>,
-    pub acc: Tensor<B, 3>,
+    pub max_score: Tensor<3>,
+    pub sum_exp: Tensor<3>,
+    pub acc: Tensor<3>,
     pub started: bool,
 }
 
-impl<B: Backend> BlockAttnState<B> {
-    pub fn new(b: usize, t: usize, d: usize, device: &B::Device) -> Self {
+impl BlockAttnState {
+    pub fn new(b: usize, t: usize, d: usize, device: &Device) -> Self {
         Self {
             partial: Tensor::zeros([b, t, d], device),
             partial_count: 0,
@@ -164,7 +176,7 @@ impl<B: Backend> BlockAttnState<B> {
         }
     }
 
-    fn incorporate(&mut self, query: &Tensor<B, 1>, src: &Tensor<B, 3>) {
+    fn incorporate(&mut self, query: &Tensor<1>, src: &Tensor<3>) {
         let s = source_score(query, src); // [B,T,1]
         if !self.started {
             self.max_score = s.clone();
@@ -173,32 +185,47 @@ impl<B: Backend> BlockAttnState<B> {
             self.started = true;
             return;
         }
-        // max(a,b) = (a + b + |a-b|) / 2 (burn 0.21 has no elementwise max)
-        let m_new =
-            (self.max_score.clone() + s.clone() + (self.max_score.clone() - s.clone()).abs())
-                .div_scalar(2.0);
+        self.merge_source(src, &s);
+    }
+
+    /// Fuse `src` (score `s`) into the online state; returns the attended
+    /// output over all attended sources (fused CUDA merge, else tensor path).
+    fn merge_source(&mut self, src: &Tensor<3>, s: &Tensor<3>) -> Tensor<3> {
+        #[cfg(feature = "cuda")]
+        if let Some(m) = crate::fused_attnres::merge_cuda(
+            &mut self.acc,
+            &mut self.max_score,
+            &mut self.sum_exp,
+            src,
+            s,
+        ) {
+            return m;
+        }
+        let m_new = (self.max_score.clone() + s.clone() + (self.max_score.clone() - s.clone()).abs())
+            .div_scalar(2.0);
         let rescale = (self.max_score.clone() - m_new.clone()).exp();
         self.acc = self.acc.clone().mul(rescale.clone())
             + src.clone().mul((s.clone() - m_new.clone()).exp());
-        self.sum_exp = self.sum_exp.clone().mul(rescale) + (s - m_new.clone()).exp();
+        self.sum_exp = self.sum_exp.clone().mul(rescale) + (s.clone() - m_new.clone()).exp();
         self.max_score = m_new;
+        self.attended()
     }
 
     /// Attention output over the currently attended sources.
-    fn attended(&self) -> Tensor<B, 3> {
+    fn attended(&self) -> Tensor<3> {
         self.acc.clone() / self.sum_exp.clone().clamp_min(1e-12)
     }
 }
 
-impl<B: Backend> BlockAttnRes<B> {
+impl BlockAttnRes {
     /// Create a fresh streaming state for `[b, t, d]` inputs.
     pub fn init_state(
         &self,
         b: usize,
         t: usize,
         d: usize,
-        device: &B::Device,
-    ) -> BlockAttnState<B> {
+        device: &Device,
+    ) -> BlockAttnState {
         BlockAttnState::new(b, t, d, device)
     }
 
@@ -211,7 +238,7 @@ impl<B: Backend> BlockAttnRes<B> {
     /// current partial sum, which would otherwise create a self-loop).
     ///
     /// Returns the depth-attention output `[B, T, D]`.
-    pub fn step(&self, h: Tensor<B, 3>, st: &mut BlockAttnState<B>) -> Tensor<B, 3> {
+    pub fn step(&self, h: Tensor<3>, st: &mut BlockAttnState) -> Tensor<3> {
         let [b, t, d] = h.dims();
         st.partial = if st.partial_count == 0 {
             h.clone()
@@ -231,16 +258,8 @@ impl<B: Backend> BlockAttnRes<B> {
         if st.partial_count >= 2 {
             let s_p = source_score(&self.query.val(), &st.partial);
             if st.started {
-                // max(a,b) = (a + b + |a-b|) / 2 (burn 0.21 has no elementwise max)
-                let m_new = (st.max_score.clone()
-                    + s_p.clone()
-                    + (st.max_score.clone() - s_p.clone()).abs())
-                .div_scalar(2.0);
-                let rescale = (st.max_score.clone() - m_new.clone()).exp();
-                let acc_p = st.acc.clone().mul(rescale.clone())
-                    + st.partial.clone().mul((s_p.clone() - m_new.clone()).exp());
-                let sum_p = st.sum_exp.clone().mul(rescale) + (s_p - m_new.clone()).exp();
-                out = acc_p / sum_p.clamp_min(1e-12);
+                let p = st.partial.clone();
+                out = st.merge_source(&p, &s_p);
             } else {
                 out = st.partial.clone();
             }
@@ -260,26 +279,24 @@ impl<B: Backend> BlockAttnRes<B> {
 mod tests {
     use super::*;
     use burn::tensor::Distribution;
-    use burn_ndarray::{NdArray, NdArrayDevice};
-    type B = NdArray;
-    fn dev() -> NdArrayDevice {
-        NdArrayDevice::default()
+    fn dev() -> Device {
+        Device::default()
     }
 
-    fn random_h(b: usize, t: usize, d: usize) -> Tensor<B, 3> {
-        Tensor::<B, 3>::random([b, t, d], Distribution::Default, &dev())
+    fn random_h(b: usize, t: usize, d: usize) -> Tensor<3> {
+        Tensor::<3>::random([b, t, d], Distribution::Default, &dev())
     }
 
     #[test]
     fn depth_attend_shape() {
         let h = vec![random_h(1, 4, 32), random_h(1, 4, 32), random_h(1, 4, 32)];
-        let q = Tensor::<B, 1>::random([32], Distribution::Default, &dev());
+        let q = Tensor::<1>::random([32], Distribution::Default, &dev());
         assert_eq!(depth_attend(&h, q).dims(), [1, 4, 32]);
     }
     #[test]
     fn depth_attend_single() {
         let h = random_h(2, 8, 16);
-        let q = Tensor::<B, 1>::random([16], Distribution::Default, &dev());
+        let q = Tensor::<1>::random([16], Distribution::Default, &dev());
         let out = depth_attend(std::slice::from_ref(&h), q);
         let d: Vec<f32> = (out - h)
             .into_data()
@@ -319,7 +336,7 @@ mod tests {
         let a = BlockAttnRes::new(16, 2, &dev());
         let (b, t, d) = (1usize, 3usize, 16usize);
         let mut st = a.init_state(b, t, d, &dev());
-        let mut history: Vec<Tensor<B, 3>> = Vec::new();
+        let mut history: Vec<Tensor<3>> = Vec::new();
         for step in 0..6 {
             let h = random_h(b, t, d);
             history.push(h.clone());

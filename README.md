@@ -46,3 +46,25 @@ let out = depth_attend(&history, query);
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE).
+
+## Performance (RTX 5060 Ti, CUDA, burn 0.22)
+
+The Full AttnRes hot path (`depth_attend`) is 8 tensor passes over
+`[L, B, T, D]` on the naive path (square, sum, sqrt, div, mul, sum, softmax,
+weighted-sum). The fused CUDA path runs it in three kernel groups:
+
+1. per-layer score launches (RMS norm + `q·h` in one read pass, shared-memory
+   tree reductions) that also fill the `[L, B, T, D]` stack as a by-product —
+   burn's `Tensor::cat` measured ~23 ms for that copy;
+2. a tiny softmax over the depth axis (one thread per `(b, t)`);
+3. one weighted-sum launch that reads the stack once and writes `out` once.
+
+| Config | Tensor path | Fused | Speedup |
+|--------|-------------|-------|---------|
+| L=24, b=1, t=2048, d=4096 | 127 ms | **24 ms** | **5.3×** |
+| L=8, b=2, t=2048, d=5120 | 60 ms | **20 ms** | **3.0×** |
+
+The streaming `BlockAttnRes` step collapses ~15 launches per layer output to
+~4: `source_score` (norm+dot) in one launch and the online-softmax merge in
+one launch (state update + attended output). Both verified == tensor path
+(<1e-4 max abs).
