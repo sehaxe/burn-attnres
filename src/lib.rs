@@ -101,6 +101,16 @@ pub fn depth_attend(history: &[Tensor<3>], query: Tensor<1>) -> Tensor<3> {
     let [b, t, d] = history[0].dims();
     let scale = (d as f64).powf(-0.5);
 
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
+    {
+        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        // variable parent count: try fixed-N specializations
+        if let Some(out) =
+            crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(history, query.clone())
+        {
+            return out;
+        }
+    }
     #[cfg(feature = "cuda")]
     if let Some(out) = crate::fused_attnres::depth_attend_cuda(history, &query) {
         return out;

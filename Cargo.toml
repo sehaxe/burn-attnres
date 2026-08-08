@@ -13,16 +13,21 @@ readme = "README.md"
 default = ["std"]
 std = ["burn/std", "burn-tensor/std", "burn/cpu"]
 cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]
+autodiff = ["burn/autodiff", "burn-tensor/std", "dep:burn-autodiff"]
 
 [dependencies]
 burn = { version = "0.22.0-pre.1", default-features = false, features = ["std", "extension"] }
 burn-tensor = { version = "0.22.0-pre.1", default-features = false }
+burn-autodiff = { version = "0.22.0-pre.1", default-features = false, features = ["std"], optional = true }
 burn-cuda = { version = "0.22.0-pre.1", optional = true, default-features = false }
 burn-cubecl = { version = "0.22.0-pre.1", optional = true, default-features = false }
 cubecl = { version = "0.11.0-pre.1", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 burn-ndarray = { version = "0.22.0-pre.1", features = ["blas-openblas"] }
+burn-autodiff = { version = "0.22.0-pre.1", default-features = false, features = ["std"] }
+burn-cuda = { version = "0.22.0-pre.1", default-features = false }
+burn = { version = "0.22.0-pre.1", default-features = false, features = ["ndarray", "autodiff", "cuda", "extension"] }
 
 [package.metadata.docs.rs]
 all-features = true

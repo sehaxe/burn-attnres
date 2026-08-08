@@ -767,3 +767,263 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "autodiff")]
+mod ad {
+    use burn::backend::{Backend, DispatchKindConversion};
+    use burn::tensor::{DispatchTensor, Tensor};
+    use burn_autodiff::checkpoint::base::Checkpointer;
+    use burn_autodiff::checkpoint::strategy::NoCheckpointing;
+    use burn_autodiff::grads::Gradients;
+    use burn_autodiff::ops::{Backward, Ops, OpsKind};
+    use burn_autodiff::Autodiff;
+
+    #[derive(Debug)]
+    struct AttnResOp;
+
+    impl<B: Backend, const N: usize> Backward<B, N> for AttnResOp
+    where
+        DispatchTensor: DispatchKindConversion<B>,
+    {
+        type State = usize; // L (number of history layers)
+
+        fn backward(
+            self,
+            ops: Ops<Self::State, N>,
+            grads: &mut Gradients,
+            checkpointer: &mut Checkpointer,
+        ) {
+            let l = ops.state;
+            let node = |i: usize| ops.parents[i].as_ref().expect("attnres input checkpointed");
+            let q = Tensor::<1>::from_primitive::<B>(checkpointer.retrieve_node_output(node(l).id));
+            let mut hs: Vec<Tensor<3>> = Vec::with_capacity(l);
+            for i in 0..l {
+                hs.push(Tensor::from_primitive::<B>(
+                    checkpointer.retrieve_node_output(node(i).id),
+                ));
+            }
+            let d_out = Tensor::from_primitive::<B>(grads.consume::<B>(&ops.node));
+            let (dhs, dq) = depth_attend_backward_tensor(&hs, &q, &d_out);
+            for (i, dh) in dhs.into_iter().enumerate() {
+                grads.register::<B>(
+                    ops.parents[i].clone().unwrap().id,
+                    dh.try_into_primitive::<B>().unwrap(),
+                );
+            }
+            grads.register::<B>(
+                ops.parents[l].clone().unwrap().id,
+                dq.try_into_primitive::<B>().unwrap(),
+            );
+        }
+    }
+
+    /// Exact full-attention backward over the depth axis (tensor path).
+    /// scores_l = q·h_l·scale/√(Σh²+ε); w = softmax(scores, 0);
+    /// out = Σ w_l·h_l. Returns (d_h per layer, d_q).
+    pub fn depth_attend_backward_tensor(
+        history: &[Tensor<3>],
+        query: &Tensor<1>,
+        d_out: &Tensor<3>,
+    ) -> (Vec<Tensor<3>>, Tensor<1>) {
+        let l = history.len();
+        let [b, t, d] = history[0].dims();
+        let scale = (d as f64).powf(-0.5);
+        let h_stack = crate::fused_attnres::stack_ad(history);
+        let q = query.clone().reshape([1, 1, 1, d]);
+        let s2 = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5); // [L,B,T,1]
+        let inv = s2.clone().powf_scalar(-0.5);
+        let scores = (q.clone() * h_stack.clone())
+            .sum_dim(3)
+            .mul(inv.clone()) // [L,B,T,1]
+            .mul_scalar(scale);
+        let w = burn::tensor::activation::softmax(scores.squeeze_dim::<3>(3), 0); // [L,B,T]
+
+        // d_w_l = Σ_d d_out·h_l; d_scores = w·(d_w − Σ_l w·d_w)
+        let d_out4 = d_out.clone().unsqueeze_dim::<4>(0); // [1,B,T,D]
+        let d_w = (d_out4.clone() * h_stack.clone())
+            .sum_dim(3)
+            .squeeze_dim::<3>(3); // [L,B,T]
+        let d_scores = w.clone() * (d_w.clone() - (w.clone() * d_w).sum_dim(0));
+
+        // d_h = w_l·d_out + scale·d_scores·(q/√s − h_l·(q·h_l)/s^(3/2))
+        let d_scores4 = d_scores.unsqueeze_dim::<4>(3); // [L,B,T,1]
+        let qh = (q.clone() * h_stack.clone()).sum_dim(3); // [L,B,T,1]
+        let dh_attn = w.unsqueeze_dim::<4>(3) * d_out4.clone(); // [L,B,T,D]
+        let dh_norm = d_scores4.clone()
+            * (q.clone() * inv.clone() - h_stack.clone() * qh * s2.clone().powf_scalar(-1.5))
+            * scale;
+        let dh_stack = dh_attn + dh_norm;
+
+        // d_q = Σ_l d_scores·scale·h_l/√s
+        let dq = (d_scores4 * h_stack * inv * scale)
+            .sum_dim(0)
+            .sum_dim(1)
+            .sum_dim(2)
+            .reshape([d]);
+
+        let dhs: Vec<Tensor<3>> = (0..l)
+            .map(|i| {
+                dh_stack
+                    .clone()
+                    .slice([i..i + 1, 0..b, 0..t, 0..d])
+                    .reshape([b, t, d])
+            })
+            .collect();
+        (dhs, dq)
+    }
+
+    /// Fused chunked depth_attend with exact backward on `Autodiff<Inner>`.
+    pub fn depth_attend_autodiff<Inner: Backend, const N: usize>(
+        history: &[Tensor<3>],
+        query: Tensor<1>,
+    ) -> Option<Tensor<3>>
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+    {
+        let l = history.len();
+        if l + 1 > N {
+            return None;
+        }
+        let qa = query.try_into_primitive::<Autodiff<Inner>>().ok()?;
+        let has: Vec<_> = history
+            .iter()
+            .map(|h| h.clone().try_into_primitive::<Autodiff<Inner>>().ok())
+            .collect::<Option<_>>()?;
+        let q_t = Tensor::from_primitive::<Inner>(qa.primitive.clone());
+        let hs_t: Vec<Tensor<3>> = has
+            .iter()
+            .map(|h| Tensor::from_primitive::<Inner>(h.primitive.clone()))
+            .collect();
+
+        let out_t = {
+            #[cfg(feature = "cuda")]
+            {
+                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
+                    if let Some(o) = super::depth_attend_cuda(&hs_t, &q_t) {
+                        o
+                    } else {
+                        super::depth_attend_tensor_ad(&hs_t, q_t)
+                    }
+                } else {
+                    super::depth_attend_tensor_ad(&hs_t, q_t)
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                super::depth_attend_tensor_ad(&hs_t, q_t)
+            }
+        };
+
+        let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
+        let mut nodes: Vec<_> = Vec::with_capacity(N);
+        for h in &has {
+            nodes.push(h.node.clone());
+        }
+        nodes.push(qa.node.clone());
+        while nodes.len() < N {
+            nodes.push(qa.node.clone());
+        }
+        let nodes: [_; N] = nodes.try_into().unwrap();
+        let prep = AttnResOp.prepare::<NoCheckpointing>(nodes);
+        let out_adt = match prep.compute_bound().stateful() {
+            OpsKind::Tracked(mut prep) => {
+                for h in &has {
+                    let _ = prep.checkpoint(h);
+                }
+                let _ = prep.checkpoint(&qa);
+                prep.finish(l, out_prim)
+            }
+            OpsKind::UnTracked(prep) => prep.finish(out_prim),
+        };
+        Some(Tensor::from_primitive::<Autodiff<Inner>>(out_adt))
+    }
+}
+
+#[cfg(feature = "autodiff")]
+pub use ad::depth_attend_autodiff;
+
+/// Stack the history into [L,B,T,D] (tensor path for the autodiff fallback).
+pub fn stack_ad(history: &[Tensor<3>]) -> Tensor<4> {
+    let stacked: Vec<Tensor<4>> = history
+        .iter()
+        .map(|h| h.clone().unsqueeze_dim::<4>(0))
+        .collect();
+    Tensor::cat(stacked, 0)
+}
+
+/// Pure tensor-path depth_attend (autodiff fallback).
+pub fn depth_attend_tensor_ad(history: &[Tensor<3>], query: Tensor<1>) -> Tensor<3> {
+    let n = history.len();
+    let [b, t, d] = history[0].dims();
+    let scale = (d as f64).powf(-0.5);
+    let h_stack = stack_ad(history);
+    let h_norm_sq = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5);
+    let h_norm = h_stack.clone() / h_norm_sq.sqrt().reshape([n, b, t, 1usize]);
+    let q = query.reshape([1, 1, 1, d]);
+    let scores = (q * h_norm).sum_dim(3).mul_scalar(scale);
+    let weights = burn::tensor::activation::softmax(scores, 0);
+    h_stack
+        .mul(weights.reshape([n, b, t, 1usize]))
+        .sum_dim(0)
+        .reshape([b, t, d])
+}
+
+#[cfg(all(test, feature = "autodiff", feature = "cuda"))]
+mod ad_tests {
+    use super::*;
+    use burn::tensor::{Device, Distribution, Tensor};
+
+    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+
+    fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    fn depth_attend_fused_backward_matches_tensor() {
+        let dev = Device::default().autodiff();
+        let (l, b, t, d) = (4usize, 2usize, 3usize, 16usize);
+        let hist: Vec<Tensor<3>> = (0..l)
+            .map(|_| Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &dev))
+            .collect();
+        let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &dev);
+
+        // fused op graph
+        let hf: Vec<Tensor<3>> = hist.iter().map(|h| h.clone().require_grad()).collect();
+        let qf = q.clone().require_grad();
+        let outf =
+            crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(&hf, qf.clone()).unwrap();
+        let loss_f = outf.powf_scalar(2.0).sum();
+        let grads_f = loss_f.backward();
+        let dhf: Vec<Tensor<3>> = hf.iter().map(|h| h.grad(&grads_f).unwrap()).collect();
+        let dqf = qf.grad(&grads_f).unwrap();
+
+        // tensor path graph
+        let ht: Vec<Tensor<3>> = hist.iter().map(|h| h.clone().require_grad()).collect();
+        let qt = q.clone().require_grad();
+        let outt = crate::depth_attend(&ht, qt.clone());
+        let loss_t = outt.powf_scalar(2.0).sum();
+        let grads_t = loss_t.backward();
+        let dht: Vec<Tensor<3>> = ht.iter().map(|h| h.grad(&grads_t).unwrap()).collect();
+        let dqt = qt.grad(&grads_t).unwrap();
+
+        for i in 0..l {
+            let md = maxdiff(&to_host(dhf[i].clone()), &to_host(dht[i].clone()));
+            assert!(md < 1e-2, "dh[{i}] maxdiff {md}");
+        }
+        let md = maxdiff(&to_host(dqf), &to_host(dqt));
+        assert!(md < 1e-2, "dq maxdiff {md}");
+    }
+}
