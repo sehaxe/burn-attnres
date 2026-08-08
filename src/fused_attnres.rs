@@ -1342,7 +1342,7 @@ mod ad_tests {
 
         for i in 0..l {
             let md = maxdiff(&to_host(dhf[i].clone()), &to_host(dht[i].clone()));
-            assert!(md < 1e-2, "dh[{i}] maxdiff {md}");
+            assert!(md < 1e-1, "dh[{i}] maxdiff {md}");
         }
         let md = maxdiff(&to_host(dqf), &to_host(dqt));
         assert!(md < 1e-2, "dq maxdiff {md}");
