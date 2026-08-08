@@ -1348,3 +1348,199 @@ mod ad_tests {
         assert!(md < 1e-2, "dq maxdiff {md}");
     }
 }
+
+#[cfg(all(test, feature = "autodiff", feature = "cuda"))]
+mod fd_tests {
+    use super::*;
+    use burn::tensor::{Device, Distribution, Tensor};
+
+    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+
+    fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    fn raw_depth_attend(hs: &[Tensor<3>], q: &Tensor<1>) -> Tensor<3> {
+        let n = hs.len();
+        let [b, t, d] = hs[0].dims();
+        let scale = (d as f64).powf(-0.5);
+        let h_stack = stack_ad(hs);
+        let hn = h_stack
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(3)
+            .add_scalar(1e-5)
+            .sqrt();
+        let hnm = h_stack.clone() / hn.reshape([n, b, t, 1usize]);
+        let sc = (q.clone().reshape([1, 1, 1, d]) * hnm)
+            .sum_dim(3)
+            .mul_scalar(scale);
+        let w = burn::tensor::activation::softmax(sc.squeeze_dim::<3>(3), 0);
+        h_stack
+            .clone()
+            .mul(w.reshape([n, b, t, 1usize]))
+            .sum_dim(0)
+            .reshape([b, t, d])
+    }
+
+    #[test]
+    fn fused_backward_matches_burn_autodiff() {
+        let dev = Device::default();
+        let adev = Device::default().autodiff();
+        let (l, b, t, d) = (3usize, 1usize, 2usize, 8usize);
+        let hist: Vec<Tensor<3>> = (0..l)
+            .map(|li| {
+                let v: Vec<f32> = (0..b * t * d)
+                    .map(|i| ((i * 7 + li * 13) % 17) as f32 / 17.0 - 0.5)
+                    .collect();
+                Tensor::<3>::from_data(burn::tensor::TensorData::new(v, [b, t, d]), &dev)
+            })
+            .collect();
+        let qv: Vec<f32> = (0..d).map(|i| ((i * 5) % 11) as f32 / 11.0 - 0.5).collect();
+        let q = Tensor::<1>::from_data(burn::tensor::TensorData::new(qv, [d]), &dev);
+        // fused op (lib dispatch)
+        let hf: Vec<Tensor<3>> = hist
+            .iter()
+            .map(|h| Tensor::<3>::from_data(h.clone().into_data(), &adev).require_grad())
+            .collect();
+        let qf = Tensor::<1>::from_data(q.clone().into_data(), &adev).require_grad();
+        let out = crate::depth_attend(&hf, qf.clone());
+        let grads = out.powf_scalar(2.0).sum().backward();
+        let fused: Vec<f32> = hf[0]
+            .grad(&grads)
+            .unwrap()
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        // raw burn autodiff
+        let hr: Vec<Tensor<3>> = hist
+            .iter()
+            .map(|h| Tensor::<3>::from_data(h.clone().into_data(), &adev).require_grad())
+            .collect();
+        let qr = Tensor::<1>::from_data(q.clone().into_data(), &adev).require_grad();
+        let outr = raw_depth_attend(&hr, &qr);
+        let grads = outr.powf_scalar(2.0).sum().backward();
+        let raw: Vec<f32> = hr[0]
+            .grad(&grads)
+            .unwrap()
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let mut worst = 0.0f32;
+        for i in 0..fused.len() {
+            worst = worst.max((fused[i] - raw[i]).abs());
+        }
+        assert!(worst < 1e-4, "fused vs burn raw autodiff worst={worst}");
+    }
+
+    #[test]
+    fn depth_attend_grad_matches_finite_difference() {
+        let dev = Device::default();
+        let adev = Device::default().autodiff();
+        let (l, b, t, d) = (3usize, 1usize, 2usize, 8usize);
+        let hist: Vec<Tensor<3>> = (0..l)
+            .map(|li| {
+                let v: Vec<f32> = (0..b * t * d)
+                    .map(|i| ((i * 7 + li * 13) % 17) as f32 / 17.0 - 0.5)
+                    .collect();
+                Tensor::<3>::from_data(burn::tensor::TensorData::new(v, [b, t, d]), &dev)
+            })
+            .collect();
+        let qv: Vec<f32> = (0..d).map(|i| ((i * 5) % 11) as f32 / 11.0 - 0.5).collect();
+        let q = Tensor::<1>::from_data(burn::tensor::TensorData::new(qv, [d]), &dev);
+        let data_h: Vec<_> = hist.iter().map(|h| h.clone().into_data()).collect();
+        let data_q = q.clone().into_data();
+
+        // analytic grads (lib dispatch -> fused op)
+        let hf: Vec<Tensor<3>> = data_h
+            .iter()
+            .map(|dt| Tensor::<3>::from_data(dt.clone(), &adev).require_grad())
+            .collect();
+        let qf = Tensor::<1>::from_data(data_q.clone(), &adev).require_grad();
+        let out = crate::depth_attend(&hf, qf.clone());
+        let grads = out.powf_scalar(2.0).sum().backward();
+        let dhs: Vec<Vec<f32>> = hf
+            .iter()
+            .map(|h| to_host(h.grad(&grads).unwrap()))
+            .collect();
+        let dq = to_host(qf.grad(&grads).unwrap());
+
+        // central finite differences
+        let eps = 1e-4f32;
+        let loss = |hs: &[Tensor<3>], q: &Tensor<1>| -> f32 {
+            crate::depth_attend(hs, q.clone())
+                .powf_scalar(2.0)
+                .sum()
+                .into_scalar::<f32>()
+        };
+        let total = b * t * d;
+        for li in 0..l {
+            let mut fd = vec![0.0f32; total];
+            for i in 0..total {
+                let mut plus = data_h[li].clone();
+                let pv = f32::from_le_bytes(plus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
+                plus.bytes[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+                let mut minus = data_h[li].clone();
+                let mv =
+                    f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+                minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+                let mut hs_p: Vec<Tensor<3>> = data_h
+                    .iter()
+                    .map(|x| Tensor::<3>::from_data(x.clone(), &dev))
+                    .collect();
+                hs_p[li] = Tensor::<3>::from_data(plus, &dev);
+                let mut hs_m: Vec<Tensor<3>> = data_h
+                    .iter()
+                    .map(|x| Tensor::<3>::from_data(x.clone(), &dev))
+                    .collect();
+                hs_m[li] = Tensor::<3>::from_data(minus, &dev);
+                let qd = Tensor::<1>::from_data(data_q.clone(), &dev);
+                fd[i] = (loss(&hs_p, &qd) - loss(&hs_m, &qd)) / (2.0 * eps);
+            }
+            for i in 0..total {
+                let rel = (dhs[li][i] - fd[i]).abs() / (fd[i].abs() + 1e-6);
+                assert!(
+                    rel < 1e-1,
+                    "layer {li} idx {i}: analytic {} vs fd {} (rel {rel})",
+                    dhs[li][i],
+                    fd[i]
+                );
+            }
+        }
+        // dq
+        let eps = 1e-4f32;
+        let mut fd = vec![0.0f32; d];
+        for i in 0..d {
+            let mut plus = data_q.clone();
+            let pv = f32::from_le_bytes(plus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
+            plus.bytes[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+            let mut minus = data_q.clone();
+            let mv = f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+            minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+            let hs: Vec<Tensor<3>> = data_h
+                .iter()
+                .map(|x| Tensor::<3>::from_data(x.clone(), &dev))
+                .collect();
+            let qp = Tensor::<1>::from_data(plus, &dev);
+            let qm = Tensor::<1>::from_data(minus, &dev);
+            fd[i] = (loss(&hs, &qp) - loss(&hs, &qm)) / (2.0 * eps);
+        }
+        for i in 0..d {
+            let rel = (dq[i] - fd[i]).abs() / (fd[i].abs() + 1e-6);
+            assert!(
+                rel < 1e-1,
+                "dq idx {i}: analytic {} vs fd {} (rel {rel})",
+                dq[i],
+                fd[i]
+            );
+        }
+    }
+}

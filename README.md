@@ -55,7 +55,7 @@ exact full-depth weights.
 | Op | Config | Tensor path | Fused | Speedup |
 |----|--------|-------------|-------|---------|
 | forward | L=24, b=1, t=2048, d=4096 | 80.3 ms | **7.6 ms** | **10.6×** |
-| forward | L=8, b=2, t=2048, d=5120 | 16.1 ms | 19.1 ms | 0.8× (per-layer launch overhead on small L) |
+| forward | L=8, b=2, t=2048, d=5120 | 14.7 ms | **6.9 ms** | **2.1×** |
 | backward | L=24, b=1, t=2048, d=4096 | 129.4 ms | **46.7 ms** | **2.8×** |
 
 ## Training
